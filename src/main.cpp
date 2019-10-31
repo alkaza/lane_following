@@ -6,7 +6,6 @@
  */
 
 #include <opencv2/core/cuda.hpp>
-#include <opencv2/core/cuda.inl.hpp>
 #include <opencv2/core/cvstd.hpp>
 #include <opencv2/core/hal/interface.h>
 #include <opencv2/core/mat.hpp>
@@ -14,28 +13,24 @@
 #include <opencv2/imgcodecs.hpp>
 #include <stddef.h>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 
-#include "ColorGradThresh.h"
-#include "CudaColorGradThresh.h"
-#include "CudaWarp.h"
-#include "Debug.h"
-#include "FindLanes.h"
-#include "LaneBase.h"
-#include "ThreadBase.h"
-#include "ThreadManager.h"
-#include "Warp.h"
+#include "lane_following/color_grad_thresh.h"
+#include "lane_following/cuda_color_grad_thresh.h"
+#include "lane_following/cuda_warp.h"
+#include "lane_following/debug.h"
+#include "lane_following/find_lanes.h"
+#include "lane_following/lane_base.h"
+#include "lane_following/thread_base.h"
+#include "lane_following/thread_manager.h"
+#include "lane_following/warp.h"
 
 void CudaInit() {
-	cv::Mat img;
-	img = cv::Mat::zeros(720, 1280, CV_8UC3);
-	cv::cuda::GpuMat gpu_img = cv::cuda::GpuMat(img);
-	CudaWarp* warp = new CudaWarp(0, false, false, false);
-	warp->setFrameImg(img);
-	warp->RunWarp();
-	delete warp;
+	cv::cuda::GpuMat gpu_img;
+	gpu_img.create(1, 1, CV_8U);
 	gpu_img.release();
 }
 
@@ -51,6 +46,8 @@ void RunWarp() {
 }
 
 void Run(tm_args *args) {
+	auto init_time = std::chrono::high_resolution_clock::now();
+
 	ThreadManager<CudaWarp, CudaColorGradThresh, FindLanes>* threadManagerCuda =
 	NULL;
 	ThreadManager<Warp, ColorGradThresh, FindLanes>* threadManager = NULL;
@@ -79,20 +76,49 @@ void Run(tm_args *args) {
 	auto start_time = std::chrono::high_resolution_clock::now();
 
 	if (threadManagerCuda) {
+		std::signal(SIGINT,
+				ThreadManager<CudaWarp, CudaColorGradThresh, FindLanes>::stSignalHandler);
 		threadManagerCuda->AddMsg(msg);
 		threadManagerCuda->WaitForThread();
 	}
 	if (threadManager) {
+		std::signal(SIGINT,
+				ThreadManager<Warp, ColorGradThresh, FindLanes>::stSignalHandler);
 		threadManager->AddMsg(msg);
 		threadManager->WaitForThread();
 	}
 
+	auto init_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+			start_time - init_time);
 	auto end_time = std::chrono::high_resolution_clock::now();
 	auto exec_duration = std::chrono::duration_cast<std::chrono::microseconds>(
 			end_time - start_time);
 #if DEBUG_ZONE_TEST
-	std::cout << std::left << std::setw(8)
-			<< exec_duration.count() / args->maxFrameCnt;
+	//std::cout << std::left << std::setw(8)
+	//		<< exec_duration.count() / args->maxFrameCnt;
+	if (threadManagerCuda) {
+		std::cout << std::left << std::setw(8) << threadManagerCuda->getAvgDuration();
+	}
+	if (threadManager) {
+		std::cout << std::left << std::setw(8) << threadManager->getAvgDuration();
+	}
+#elif DEBUG_ZONE_TEST_SPEED
+	std::cout << "<" << (args->bParallel ? "Parallel" : "")
+			<< (args->bGpuAccel ? "GpuAccel" : "")
+			<< (args->pipelineInstNum > 1 ? "Pipeline" : "Sequential") << ">"
+			<< std::endl;
+	std::cout << std::left << std::setw(8) << "Time" << std::setw(8) << "Speed"
+			<< std::endl;
+	if (threadManagerCuda) {
+		std::cout << std::left << std::setw(8)
+				<< threadManagerCuda->getAvgDuration() << std::setw(8)
+				<< threadManagerCuda->getAvgSpeed() << std::endl;
+	}
+	if (threadManager) {
+		std::cout << std::left << std::setw(8)
+				<< threadManager->getAvgDuration() << std::setw(8)
+				<< threadManager->getAvgSpeed() << std::endl;
+	}
 #else
 	std::cout << "<" << (args->bParallel ? "Parallel" : "")
 			<< (args->bGpuAccel ? "GpuAccel" : "")
@@ -104,16 +130,18 @@ void Run(tm_args *args) {
 			<< args->pipelineInstNum << std::endl;
 	std::cout << std::left << std::setw(20) << "Frames" << args->maxFrameCnt
 			<< std::endl;
-	std::cout << std::left << std::setw(20) << "Execution time" << std::setw(12)
+	std::cout << std::left << std::setw(20) << "Initialization time" << std::setw(12)
+			<< init_duration.count() << " usec" << std::endl;
+	std::cout << std::left << std::setw(20) << "Total execution time" << std::setw(12)
 			<< exec_duration.count() << " usec" << std::endl;
-	std::cout << std::left << std::setw(20) << "Reaction time" << std::setw(12)
+	std::cout << std::left << std::setw(20) << "Avg execution time" << std::setw(12)
 			<< exec_duration.count() / args->maxFrameCnt << " usec" << std::endl
 			<< std::endl;
 	if (threadManagerCuda) {
-		threadManagerCuda->PrintAvgDurations();
+		threadManagerCuda->PrintAvgFuncDurations();
 	}
 	if (threadManager) {
-		threadManager->PrintAvgDurations();
+		threadManager->PrintAvgFuncDurations();
 	}
 #endif
 	delete threadManagerCuda;
@@ -122,6 +150,7 @@ void Run(tm_args *args) {
 
 }
 void TestHelper(tm_args *args) {
+#if DEBUG_ZONE_TEST
 	std::cout << "<" << (args->bParallel ? "Parallel" : "")
 			<< (args->bGpuAccel ? "GpuAccel" : "")
 			<< (args->pipelineInstNum > 1 ? "Pipeline" : "Sequential") << ">"
@@ -140,17 +169,25 @@ void TestHelper(tm_args *args) {
 		}
 		std::cout << std::endl;
 	}
+#elif DEBUG_ZONE_TEST_SPEED
+	args->threadPoolSize = 8;
+	args->pipelineInstNum = 1;
+	Run(args);
+	args->pipelineInstNum = 8;
+	Run(args);
+#endif
 }
 
 void Test() {
 	tm_args args;
-	args.videoFile = "project_video.mp4";
+	args.videoFile = "raw_video.avi";
 	args.maxFrameCnt = 100;
-	args.bVerbose = true;
+	args.bVerbose = false;
 
 	args.bGpuAccel = false;
 	args.bParallel = false;
 	TestHelper(&args);
+
 	args.bParallel = true;
 	TestHelper(&args);
 
@@ -158,20 +195,29 @@ void Test() {
 	args.bParallel = false;
 	CudaInit();
 	TestHelper(&args);
+
 	args.bParallel = true;
 	TestHelper(&args);
 }
 
 int main(int argc, char** argv) {
-#if DEBUG_ZONE_TEST
+#if DEBUG_ZONE_ROS
+	ros::init(argc, argv, "lane_following_node",
+	ros::init_options::NoSigintHandler);
+#endif
+
+#if DEBUG_ZONE_TEST || DEBUG_ZONE_TEST_SPEED
 	Test();
 #else
 	tm_args args;
 	args.videoFile = "raw_video.avi";
+	args.threadPoolSize = 8;
+	args.pipelineInstNum = 4;
 	args.maxFrameCnt = 100;
-	args.pipelineInstNum = 1;
+	args.speed = 3000;
+	args.delay = 0;
 	args.bVerbose = true;
-	args.bGpuAccel = false;
+	args.bGpuAccel = true;
 	args.bParallel = true;
 	Run(&args);
 	return 0;
